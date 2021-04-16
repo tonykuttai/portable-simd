@@ -40,14 +40,6 @@ extern "platform-intrinsic" {
     /// fptoui/fptosi/uitofp/sitofp
     pub(crate) fn simd_cast<T, U>(x: T) -> U;
 
-    // floor
-    #[cfg(feature = "std")]
-    pub(crate) fn simd_floor<T>(x: T) -> T;
-
-    // ceil
-    #[cfg(feature = "std")]
-    pub(crate) fn simd_ceil<T>(x: T) -> T;
-
     pub(crate) fn simd_eq<T, U>(x: T, y: T) -> U;
     pub(crate) fn simd_ne<T, U>(x: T, y: T) -> U;
     pub(crate) fn simd_lt<T, U>(x: T, y: T) -> U;
@@ -68,3 +60,23 @@ extern "platform-intrinsic" {
     // {s,u}sub.sat
     pub(crate) fn simd_saturating_sub<T>(x: T, y: T) -> T;
 }
+
+#[cfg(feature = "std")]
+mod std {
+    extern "platform-intrinsic" {
+        // ceil
+        pub(crate) fn simd_ceil<T>(x: T) -> T;
+
+        // floor
+        pub(crate) fn simd_floor<T>(x: T) -> T;
+
+        // round
+        pub(crate) fn simd_round<T>(x: T) -> T;
+
+        // trunc
+        pub(crate) fn simd_trunc<T>(x: T) -> T;
+    }
+}
+
+#[cfg(feature = "std")]
+pub(crate) use crate::intrinsics::std::*;
