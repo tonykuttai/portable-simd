@@ -526,3 +526,31 @@ impl Sealed for f64 {}
 unsafe impl SimdElement for f64 {
     type Mask = i64;
 }
+
+impl<T, const LANES: usize> Sealed for Simd<T, LANES>
+where
+    T: SimdElement,
+    LaneCount<LANES>: SupportedLaneCount,
+{
+}
+
+// FIXME(jubilee): This is a brutal hack for an "inherent associated type".
+// It's not that bad, really, but neither is it necessary per se.
+
+/// A trait describing a vector's associated scalar type.
+/// This is just a hack around inherent associated types requiring lazy norm.
+#[doc(hidden)]
+pub trait Vector: Sealed {
+    /// A vector's associated scalar type.
+    #[doc(hidden)]
+    type Scalar: SimdElement;
+}
+
+#[doc(hidden)]
+impl<T, const LANES: usize> Vector for Simd<T, LANES>
+where
+    T: SimdElement,
+    LaneCount<LANES>: SupportedLaneCount,
+{
+    type Scalar = T;
+}
