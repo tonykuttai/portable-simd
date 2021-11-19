@@ -1,5 +1,16 @@
-use crate::simd::intrinsics;
-use crate::simd::{LaneCount, Simd, SimdElement, SupportedLaneCount};
+//! The organization of this module deserves some explanation.
+//!
+use crate::simd::{LaneCount, Mask, Simd, SimdElement, SupportedLaneCount, Vector};
+use core::ops::{Add, Mul}; // commutative arithmetic binary ops
+use core::ops::{BitAnd, BitOr, BitXor};
+use core::ops::{Div, Rem, Sub}; // non-commutative arithmetic binary ops
+use core::ops::{Shl, Shr}; // non-commutative bit binary ops
+
+mod assign;
+mod splat;
+mod unop;
+
+// Indexing
 
 impl<I, T, const LANES: usize> core::ops::Index<I> for Simd<T, LANES>
 where
@@ -8,6 +19,8 @@ where
     I: core::slice::SliceIndex<[T]>,
 {
     type Output = I::Output;
+
+    #[inline]
     fn index(&self, index: I) -> &Self::Output {
         &self.as_array()[index]
     }
@@ -19,626 +32,1122 @@ where
     LaneCount<LANES>: SupportedLaneCount,
     I: core::slice::SliceIndex<[T]>,
 {
+    #[inline]
     fn index_mut(&mut self, index: I) -> &mut Self::Output {
         &mut self.as_mut_array()[index]
     }
 }
 
-/// Checks if the right-hand side argument of a left- or right-shift would cause overflow.
-fn invalid_shift_rhs<T>(rhs: T) -> bool
-where
-    T: Default + PartialOrd + core::convert::TryFrom<usize>,
-    <T as core::convert::TryFrom<usize>>::Error: core::fmt::Debug,
-{
-    let bits_in_type = T::try_from(8 * core::mem::size_of::<T>()).unwrap();
-    rhs < T::default() || rhs >= bits_in_type
+macro_rules! unsafe_base_op {
+    ( impl<const LANES: usize> $op:ident for Simd<$scalar:ty, LANES> {
+        fn $call:ident(self, rhs: Self) -> Self::Output {
+            unsafe{ $simd_call:ident }
+        }
+    }) => {
+        impl<const LANES: usize> $op for Simd<$scalar, LANES>
+        where
+            $scalar: SimdElement,
+            LaneCount<LANES>: SupportedLaneCount,
+        {
+            type Output = Self;
+
+            #[inline]
+            fn $call(self, rhs: Self) -> Self::Output {
+                unsafe { $crate::intrinsics::$simd_call(self, rhs) }
+            }
+        }
+    };
 }
 
-/// Automatically implements operators over references in addition to the provided operator.
-macro_rules! impl_ref_ops {
-    // binary op
-    {
-        impl<const $lanes:ident: usize> core::ops::$trait:ident<$rhs:ty> for $type:ty
-        where
-            LaneCount<$lanes2:ident>: SupportedLaneCount,
-        {
-            type Output = $output:ty;
-
-            $(#[$attrs:meta])*
-            fn $fn:ident($self_tok:ident, $rhs_arg:ident: $rhs_arg_ty:ty) -> Self::Output $body:tt
-        }
-    } => {
-        impl<const $lanes: usize> core::ops::$trait<$rhs> for $type
-        where
-            LaneCount<$lanes2>: SupportedLaneCount,
-        {
-            type Output = $output;
-
-            $(#[$attrs])*
-            fn $fn($self_tok, $rhs_arg: $rhs_arg_ty) -> Self::Output $body
-        }
-
-        impl<const $lanes: usize> core::ops::$trait<&'_ $rhs> for $type
-        where
-            LaneCount<$lanes2>: SupportedLaneCount,
-        {
-            type Output = <$type as core::ops::$trait<$rhs>>::Output;
-
-            $(#[$attrs])*
-            fn $fn($self_tok, $rhs_arg: &$rhs) -> Self::Output {
-                core::ops::$trait::$fn($self_tok, *$rhs_arg)
-            }
-        }
-
-        impl<const $lanes: usize> core::ops::$trait<$rhs> for &'_ $type
-        where
-            LaneCount<$lanes2>: SupportedLaneCount,
-        {
-            type Output = <$type as core::ops::$trait<$rhs>>::Output;
-
-            $(#[$attrs])*
-            fn $fn($self_tok, $rhs_arg: $rhs) -> Self::Output {
-                core::ops::$trait::$fn(*$self_tok, $rhs_arg)
-            }
-        }
-
-        impl<const $lanes: usize> core::ops::$trait<&'_ $rhs> for &'_ $type
-        where
-            LaneCount<$lanes2>: SupportedLaneCount,
-        {
-            type Output = <$type as core::ops::$trait<$rhs>>::Output;
-
-            $(#[$attrs])*
-            fn $fn($self_tok, $rhs_arg: &$rhs) -> Self::Output {
-                core::ops::$trait::$fn(*$self_tok, *$rhs_arg)
-            }
-        }
-    };
-
-    // binary assignment op
-    {
-        impl<const $lanes:ident: usize> core::ops::$trait:ident<$rhs:ty> for $type:ty
-        where
-            LaneCount<$lanes2:ident>: SupportedLaneCount,
-        {
-            $(#[$attrs:meta])*
-            fn $fn:ident(&mut $self_tok:ident, $rhs_arg:ident: $rhs_arg_ty:ty) $body:tt
-        }
-    } => {
-        impl<const $lanes: usize> core::ops::$trait<$rhs> for $type
-        where
-            LaneCount<$lanes2>: SupportedLaneCount,
-        {
-            $(#[$attrs])*
-            fn $fn(&mut $self_tok, $rhs_arg: $rhs_arg_ty) $body
-        }
-
-        impl<const $lanes: usize> core::ops::$trait<&'_ $rhs> for $type
-        where
-            LaneCount<$lanes2>: SupportedLaneCount,
-        {
-            $(#[$attrs])*
-            fn $fn(&mut $self_tok, $rhs_arg: &$rhs_arg_ty) {
-                core::ops::$trait::$fn($self_tok, *$rhs_arg)
-            }
-        }
-    };
-
-    // unary op
-    {
-        impl<const $lanes:ident: usize> core::ops::$trait:ident for $type:ty
-        where
-            LaneCount<$lanes2:ident>: SupportedLaneCount,
-        {
-            type Output = $output:ty;
-            fn $fn:ident($self_tok:ident) -> Self::Output $body:tt
-        }
-    } => {
-        impl<const $lanes: usize> core::ops::$trait for $type
-        where
-            LaneCount<$lanes2>: SupportedLaneCount,
-        {
-            type Output = $output;
-            fn $fn($self_tok) -> Self::Output $body
-        }
-
-        impl<const $lanes: usize> core::ops::$trait for &'_ $type
-        where
-            LaneCount<$lanes2>: SupportedLaneCount,
-        {
-            type Output = <$type as core::ops::$trait>::Output;
-            fn $fn($self_tok) -> Self::Output {
-                core::ops::$trait::$fn(*$self_tok)
-            }
+unsafe_base_op! {
+    impl<const LANES: usize> Add for Simd<f32, LANES> {
+        fn add(self, rhs: Self) -> Self::Output {
+            unsafe { simd_add }
         }
     }
 }
 
-/// Automatically implements operators over vectors and scalars for a particular vector.
-macro_rules! impl_op {
-    { impl Add for $scalar:ty } => {
-        impl_op! { @binary $scalar, Add::add, AddAssign::add_assign, simd_add }
-    };
-    { impl Sub for $scalar:ty } => {
-        impl_op! { @binary $scalar, Sub::sub, SubAssign::sub_assign, simd_sub }
-    };
-    { impl Mul for $scalar:ty } => {
-        impl_op! { @binary $scalar, Mul::mul, MulAssign::mul_assign, simd_mul }
-    };
-    { impl Div for $scalar:ty } => {
-        impl_op! { @binary $scalar, Div::div, DivAssign::div_assign, simd_div }
-    };
-    { impl Rem for $scalar:ty } => {
-        impl_op! { @binary $scalar, Rem::rem, RemAssign::rem_assign, simd_rem }
-    };
-    { impl Shl for $scalar:ty } => {
-        impl_op! { @binary $scalar, Shl::shl, ShlAssign::shl_assign, simd_shl }
-    };
-    { impl Shr for $scalar:ty } => {
-        impl_op! { @binary $scalar, Shr::shr, ShrAssign::shr_assign, simd_shr }
-    };
-    { impl BitAnd for $scalar:ty } => {
-        impl_op! { @binary $scalar, BitAnd::bitand, BitAndAssign::bitand_assign, simd_and }
-    };
-    { impl BitOr for $scalar:ty } => {
-        impl_op! { @binary $scalar, BitOr::bitor, BitOrAssign::bitor_assign, simd_or }
-    };
-    { impl BitXor for $scalar:ty } => {
-        impl_op! { @binary $scalar, BitXor::bitxor, BitXorAssign::bitxor_assign, simd_xor }
-    };
+unsafe_base_op! {
+    impl<const LANES: usize> Add for Simd<f64, LANES> {
+        fn add(self, rhs: Self) -> Self::Output {
+            unsafe { simd_add }
+        }
+    }
+}
 
-    { impl Not for $scalar:ty } => {
-        impl_ref_ops! {
-            impl<const LANES: usize> core::ops::Not for Simd<$scalar, LANES>
-            where
-                LaneCount<LANES>: SupportedLaneCount,
-            {
-                type Output = Self;
-                fn not(self) -> Self::Output {
-                    self ^ Self::splat(!<$scalar>::default())
+unsafe_base_op! {
+    impl<const LANES: usize> Add for Simd<i8, LANES> {
+        fn add(self, rhs: Self) -> Self::Output {
+            unsafe { simd_add }
+        }
+    }
+}
+
+unsafe_base_op! {
+    impl<const LANES: usize> Add for Simd<i16, LANES> {
+        fn add(self, rhs: Self) -> Self::Output {
+            unsafe { simd_add }
+        }
+    }
+}
+
+unsafe_base_op! {
+    impl<const LANES: usize> Add for Simd<i32, LANES> {
+        fn add(self, rhs: Self) -> Self::Output {
+            unsafe { simd_add }
+        }
+    }
+}
+
+unsafe_base_op! {
+    impl<const LANES: usize> Add for Simd<i64, LANES> {
+        fn add(self, rhs: Self) -> Self::Output {
+            unsafe { simd_add }
+        }
+    }
+}
+
+unsafe_base_op! {
+    impl<const LANES: usize> Add for Simd<isize, LANES> {
+        fn add(self, rhs: Self) -> Self::Output {
+            unsafe { simd_add }
+        }
+    }
+}
+
+unsafe_base_op! {
+    impl<const LANES: usize> Add for Simd<u8, LANES> {
+        fn add(self, rhs: Self) -> Self::Output {
+            unsafe { simd_add }
+        }
+    }
+}
+
+unsafe_base_op! {
+    impl<const LANES: usize> Add for Simd<u16, LANES> {
+        fn add(self, rhs: Self) -> Self::Output {
+            unsafe { simd_add }
+        }
+    }
+}
+
+unsafe_base_op! {
+    impl<const LANES: usize> Add for Simd<u32, LANES> {
+        fn add(self, rhs: Self) -> Self::Output {
+            unsafe { simd_add }
+        }
+    }
+}
+
+unsafe_base_op! {
+    impl<const LANES: usize> Add for Simd<u64, LANES> {
+        fn add(self, rhs: Self) -> Self::Output {
+            unsafe { simd_add }
+        }
+    }
+}
+
+unsafe_base_op! {
+    impl<const LANES: usize> Add for Simd<usize, LANES> {
+        fn add(self, rhs: Self) -> Self::Output {
+            unsafe { simd_add }
+        }
+    }
+}
+
+unsafe_base_op! {
+    impl<const LANES: usize> Mul for Simd<f32, LANES> {
+        fn mul(self, rhs: Self) -> Self::Output {
+            unsafe { simd_mul }
+        }
+    }
+}
+
+unsafe_base_op! {
+    impl<const LANES: usize> Mul for Simd<f64, LANES> {
+        fn mul(self, rhs: Self) -> Self::Output {
+            unsafe { simd_mul }
+        }
+    }
+}
+
+unsafe_base_op! {
+    impl<const LANES: usize> Mul for Simd<i8, LANES> {
+        fn mul(self, rhs: Self) -> Self::Output {
+            unsafe { simd_mul }
+        }
+    }
+}
+
+unsafe_base_op! {
+    impl<const LANES: usize> Mul for Simd<i16, LANES> {
+        fn mul(self, rhs: Self) -> Self::Output {
+            unsafe { simd_mul }
+        }
+    }
+}
+
+unsafe_base_op! {
+    impl<const LANES: usize> Mul for Simd<i32, LANES> {
+        fn mul(self, rhs: Self) -> Self::Output {
+            unsafe { simd_mul }
+        }
+    }
+}
+
+unsafe_base_op! {
+    impl<const LANES: usize> Mul for Simd<i64, LANES> {
+        fn mul(self, rhs: Self) -> Self::Output {
+            unsafe { simd_mul }
+        }
+    }
+}
+
+unsafe_base_op! {
+    impl<const LANES: usize> Mul for Simd<isize, LANES> {
+        fn mul(self, rhs: Self) -> Self::Output {
+            unsafe { simd_mul }
+        }
+    }
+}
+
+unsafe_base_op! {
+    impl<const LANES: usize> Mul for Simd<u8, LANES> {
+        fn mul(self, rhs: Self) -> Self::Output {
+            unsafe { simd_mul }
+        }
+    }
+}
+
+unsafe_base_op! {
+    impl<const LANES: usize> Mul for Simd<u16, LANES> {
+        fn mul(self, rhs: Self) -> Self::Output {
+            unsafe { simd_mul }
+        }
+    }
+}
+
+unsafe_base_op! {
+    impl<const LANES: usize> Mul for Simd<u32, LANES> {
+        fn mul(self, rhs: Self) -> Self::Output {
+            unsafe { simd_mul }
+        }
+    }
+}
+
+unsafe_base_op! {
+    impl<const LANES: usize> Mul for Simd<u64, LANES> {
+        fn mul(self, rhs: Self) -> Self::Output {
+            unsafe { simd_mul }
+        }
+    }
+}
+
+unsafe_base_op! {
+    impl<const LANES: usize> Mul for Simd<usize, LANES> {
+        fn mul(self, rhs: Self) -> Self::Output {
+            unsafe { simd_mul }
+        }
+    }
+}
+
+unsafe_base_op! {
+    impl<const LANES: usize> Sub for Simd<f32, LANES> {
+        fn sub(self, rhs: Self) -> Self::Output {
+            unsafe { simd_sub }
+        }
+    }
+}
+
+unsafe_base_op! {
+    impl<const LANES: usize> Sub for Simd<f64, LANES> {
+        fn sub(self, rhs: Self) -> Self::Output {
+            unsafe { simd_sub }
+        }
+    }
+}
+
+unsafe_base_op! {
+    impl<const LANES: usize> Sub for Simd<i8, LANES> {
+        fn sub(self, rhs: Self) -> Self::Output {
+            unsafe { simd_sub }
+        }
+    }
+}
+
+unsafe_base_op! {
+    impl<const LANES: usize> Sub for Simd<i16, LANES> {
+        fn sub(self, rhs: Self) -> Self::Output {
+            unsafe { simd_sub }
+        }
+    }
+}
+
+unsafe_base_op! {
+    impl<const LANES: usize> Sub for Simd<i32, LANES> {
+        fn sub(self, rhs: Self) -> Self::Output {
+            unsafe { simd_sub }
+        }
+    }
+}
+
+unsafe_base_op! {
+    impl<const LANES: usize> Sub for Simd<i64, LANES> {
+        fn sub(self, rhs: Self) -> Self::Output {
+            unsafe { simd_sub }
+        }
+    }
+}
+
+unsafe_base_op! {
+    impl<const LANES: usize> Sub for Simd<isize, LANES> {
+        fn sub(self, rhs: Self) -> Self::Output {
+            unsafe { simd_sub }
+        }
+    }
+}
+
+unsafe_base_op! {
+    impl<const LANES: usize> Sub for Simd<u8, LANES> {
+        fn sub(self, rhs: Self) -> Self::Output {
+            unsafe { simd_sub }
+        }
+    }
+}
+
+unsafe_base_op! {
+    impl<const LANES: usize> Sub for Simd<u16, LANES> {
+        fn sub(self, rhs: Self) -> Self::Output {
+            unsafe { simd_sub }
+        }
+    }
+}
+
+unsafe_base_op! {
+    impl<const LANES: usize> Sub for Simd<u32, LANES> {
+        fn sub(self, rhs: Self) -> Self::Output {
+            unsafe { simd_sub }
+        }
+    }
+}
+
+unsafe_base_op! {
+    impl<const LANES: usize> Sub for Simd<u64, LANES> {
+        fn sub(self, rhs: Self) -> Self::Output {
+            unsafe { simd_sub }
+        }
+    }
+}
+
+unsafe_base_op! {
+    impl<const LANES: usize> Sub for Simd<usize, LANES> {
+        fn sub(self, rhs: Self) -> Self::Output {
+            unsafe { simd_sub }
+        }
+    }
+}
+
+// Division
+// Remainder
+// These get a bit more complicated for the ones past floats.
+
+unsafe_base_op! {
+    impl<const LANES: usize> Div for Simd<f32, LANES> {
+        fn div(self, rhs: Self) -> Self::Output {
+            unsafe { simd_div }
+        }
+    }
+}
+
+unsafe_base_op! {
+    impl<const LANES: usize> Div for Simd<f64, LANES> {
+        fn div(self, rhs: Self) -> Self::Output {
+            unsafe { simd_div }
+        }
+    }
+}
+
+unsafe_base_op! {
+    impl<const LANES: usize> Rem for Simd<f32, LANES> {
+        fn rem(self, rhs: Self) -> Self::Output {
+            unsafe { simd_rem }
+        }
+    }
+}
+
+unsafe_base_op! {
+    impl<const LANES: usize> Rem for Simd<f64, LANES> {
+        fn rem(self, rhs: Self) -> Self::Output {
+            unsafe { simd_rem }
+        }
+    }
+}
+
+macro_rules! sint_divrem_guard {
+    ( impl<const LANES: usize> Div for Simd<$sint:ty, LANES> {
+        fn $call:ident
+    }) => {
+        impl<const LANES: usize> Div for Simd<$sint, LANES>
+        where
+            $sint: SimdElement,
+            LaneCount<LANES>: SupportedLaneCount,
+        {
+            type Output = Self;
+
+            #[inline]
+            fn $call(self, rhs: Self) -> Self::Output {
+                if rhs.lanes_eq(Simd::splat(0)).any() {
+                    panic!("attempt to divide by zero");
+                } else if self.lanes_eq(Simd::splat(<$sint>::MIN)) & rhs.lanes_eq(Simd::splat(-1))
+                    != Mask::splat(false)
+                {
+                    panic!("attempt to divide with overflow");
+                } else {
+                    unsafe { $crate::intrinsics::simd_div(self, rhs) }
                 }
             }
         }
     };
+    ( impl<const LANES: usize> Rem for Simd<$sint:ty, LANES> {
+        fn $call:ident
+    }) => {
+        impl<const LANES: usize> Rem for Simd<$sint, LANES>
+        where
+            $sint: SimdElement,
+            LaneCount<LANES>: SupportedLaneCount,
+        {
+            type Output = Self;
 
-    { impl Neg for $scalar:ty } => {
-        impl_ref_ops! {
-            impl<const LANES: usize> core::ops::Neg for Simd<$scalar, LANES>
-            where
-                LaneCount<LANES>: SupportedLaneCount,
-            {
-                type Output = Self;
-                fn neg(self) -> Self::Output {
-                    unsafe { intrinsics::simd_neg(self) }
-                }
-            }
-        }
-    };
-
-    // generic binary op with assignment when output is `Self`
-    { @binary $scalar:ty, $trait:ident :: $trait_fn:ident, $assign_trait:ident :: $assign_trait_fn:ident, $intrinsic:ident } => {
-        impl_ref_ops! {
-            impl<const LANES: usize> core::ops::$trait<Self> for Simd<$scalar, LANES>
-            where
-                LaneCount<LANES>: SupportedLaneCount,
-            {
-                type Output = Self;
-
-                #[inline]
-                fn $trait_fn(self, rhs: Self) -> Self::Output {
-                    unsafe {
-                        intrinsics::$intrinsic(self, rhs)
-                    }
-                }
-            }
-        }
-
-        impl_ref_ops! {
-            impl<const LANES: usize> core::ops::$trait<$scalar> for Simd<$scalar, LANES>
-            where
-                LaneCount<LANES>: SupportedLaneCount,
-            {
-                type Output = Self;
-
-                #[inline]
-                fn $trait_fn(self, rhs: $scalar) -> Self::Output {
-                    core::ops::$trait::$trait_fn(self, Self::splat(rhs))
-                }
-            }
-        }
-
-        impl_ref_ops! {
-            impl<const LANES: usize> core::ops::$trait<Simd<$scalar, LANES>> for $scalar
-            where
-                LaneCount<LANES>: SupportedLaneCount,
-            {
-                type Output = Simd<$scalar, LANES>;
-
-                #[inline]
-                fn $trait_fn(self, rhs: Simd<$scalar, LANES>) -> Self::Output {
-                    core::ops::$trait::$trait_fn(Simd::splat(self), rhs)
-                }
-            }
-        }
-
-        impl_ref_ops! {
-            impl<const LANES: usize> core::ops::$assign_trait<Self> for Simd<$scalar, LANES>
-            where
-                LaneCount<LANES>: SupportedLaneCount,
-            {
-                #[inline]
-                fn $assign_trait_fn(&mut self, rhs: Self) {
-                    unsafe {
-                        *self = intrinsics::$intrinsic(*self, rhs);
-                    }
-                }
-            }
-        }
-
-        impl_ref_ops! {
-            impl<const LANES: usize> core::ops::$assign_trait<$scalar> for Simd<$scalar, LANES>
-            where
-                LaneCount<LANES>: SupportedLaneCount,
-            {
-                #[inline]
-                fn $assign_trait_fn(&mut self, rhs: $scalar) {
-                    core::ops::$assign_trait::$assign_trait_fn(self, Self::splat(rhs));
+            #[inline]
+            fn $call(self, rhs: Self) -> Self::Output {
+                if rhs.lanes_eq(Simd::splat(0)).any() {
+                    panic!("attempt to calculate the remainder with a divisor of zero");
+                } else if self.lanes_eq(Simd::splat(<$sint>::MIN)) & rhs.lanes_eq(Simd::splat(-1))
+                    != Mask::splat(false)
+                {
+                    panic!("attempt to calculate the remainder with overflow");
+                } else {
+                    unsafe { $crate::intrinsics::simd_rem(self, rhs) }
                 }
             }
         }
     };
 }
 
-/// Implements floating-point operators for the provided types.
-macro_rules! impl_float_ops {
-    { $($scalar:ty),* } => {
-        $(
-            impl_op! { impl Add for $scalar }
-            impl_op! { impl Sub for $scalar }
-            impl_op! { impl Mul for $scalar }
-            impl_op! { impl Div for $scalar }
-            impl_op! { impl Rem for $scalar }
-            impl_op! { impl Neg for $scalar }
-        )*
+macro_rules! uint_divrem_guard {
+    ( impl<const LANES: usize> Div for Simd<$uint:ty, LANES> {
+        fn $call:ident
+    }) => {
+        impl<const LANES: usize> Div for Simd<$uint, LANES>
+        where
+            $uint: SimdElement,
+            LaneCount<LANES>: SupportedLaneCount,
+        {
+            type Output = Self;
+
+            #[inline]
+            fn $call(self, rhs: Self) -> Self::Output {
+                if rhs.lanes_eq(Simd::splat(0)).any() {
+                    panic!("attempt to divide by zero");
+                } else {
+                    unsafe { $crate::intrinsics::simd_div(self, rhs) }
+                }
+            }
+        }
+    };
+    ( impl<const LANES: usize> Rem for Simd<$uint:ty, LANES> {
+        fn $call:ident
+    }) => {
+        impl<const LANES: usize> Rem for Simd<$uint, LANES>
+        where
+            $uint: SimdElement,
+            LaneCount<LANES>: SupportedLaneCount,
+        {
+            type Output = Self;
+
+            #[inline]
+            fn $call(self, rhs: Self) -> Self::Output {
+                if rhs.lanes_eq(Simd::splat(0)).any() {
+                    panic!("attempt to calculate the remainder with a divisor of zero");
+                } else {
+                    unsafe { $crate::intrinsics::simd_rem(self, rhs) }
+                }
+            }
+        }
     };
 }
 
-/// Implements unsigned integer operators for the provided types.
-macro_rules! impl_unsigned_int_ops {
-    { $($scalar:ty),* } => {
-        $(
-            impl_op! { impl Add for $scalar }
-            impl_op! { impl Sub for $scalar }
-            impl_op! { impl Mul for $scalar }
-            impl_op! { impl BitAnd for $scalar }
-            impl_op! { impl BitOr  for $scalar }
-            impl_op! { impl BitXor for $scalar }
-            impl_op! { impl Not for $scalar }
+sint_divrem_guard! {
+    impl<const LANES: usize> Div for Simd<i8, LANES> {
+        fn div
+    }
+}
 
-            // Integers panic on divide by 0
-            impl_ref_ops! {
-                impl<const LANES: usize> core::ops::Div<Self> for Simd<$scalar, LANES>
-                where
-                    LaneCount<LANES>: SupportedLaneCount,
-                {
-                    type Output = Self;
+sint_divrem_guard! {
+    impl<const LANES: usize> Rem for Simd<i8, LANES> {
+        fn rem
+    }
+}
 
-                    #[inline]
-                    fn div(self, rhs: Self) -> Self::Output {
-                        if rhs.as_array()
-                            .iter()
-                            .any(|x| *x == 0)
-                        {
-                            panic!("attempt to divide by zero");
-                        }
+sint_divrem_guard! {
+    impl<const LANES: usize> Div for Simd<i16, LANES> {
+        fn div
+    }
+}
 
-                        // Guards for div(MIN, -1),
-                        // this check only applies to signed ints
-                        if <$scalar>::MIN != 0 && self.as_array().iter()
-                                .zip(rhs.as_array().iter())
-                                .any(|(x,y)| *x == <$scalar>::MIN && *y == -1 as _) {
-                            panic!("attempt to divide with overflow");
-                        }
-                        unsafe { intrinsics::simd_div(self, rhs) }
-                    }
+sint_divrem_guard! {
+    impl<const LANES: usize> Rem for Simd<i16, LANES> {
+        fn rem
+    }
+}
+
+sint_divrem_guard! {
+    impl<const LANES: usize> Div for Simd<i32, LANES> {
+        fn div
+    }
+}
+
+sint_divrem_guard! {
+    impl<const LANES: usize> Rem for Simd<i32, LANES> {
+        fn rem
+    }
+}
+
+sint_divrem_guard! {
+    impl<const LANES: usize> Div for Simd<i64, LANES> {
+        fn div
+    }
+}
+
+sint_divrem_guard! {
+    impl<const LANES: usize> Rem for Simd<i64, LANES> {
+        fn rem
+    }
+}
+
+sint_divrem_guard! {
+    impl<const LANES: usize> Div for Simd<isize, LANES> {
+        fn div
+    }
+}
+
+sint_divrem_guard! {
+    impl<const LANES: usize> Rem for Simd<isize, LANES> {
+        fn rem
+    }
+}
+
+uint_divrem_guard! {
+    impl<const LANES: usize> Div for Simd<u8, LANES> {
+        fn div
+    }
+}
+
+uint_divrem_guard! {
+    impl<const LANES: usize> Rem for Simd<u8, LANES> {
+        fn rem
+    }
+}
+
+uint_divrem_guard! {
+    impl<const LANES: usize> Div for Simd<u16, LANES> {
+        fn div
+    }
+}
+
+uint_divrem_guard! {
+    impl<const LANES: usize> Rem for Simd<u16, LANES> {
+        fn rem
+    }
+}
+
+uint_divrem_guard! {
+    impl<const LANES: usize> Div for Simd<u32, LANES> {
+        fn div
+    }
+}
+
+uint_divrem_guard! {
+    impl<const LANES: usize> Rem for Simd<u32, LANES> {
+        fn rem
+    }
+}
+
+uint_divrem_guard! {
+    impl<const LANES: usize> Div for Simd<u64, LANES> {
+        fn div
+    }
+}
+
+uint_divrem_guard! {
+    impl<const LANES: usize> Rem for Simd<u64, LANES> {
+        fn rem
+    }
+}
+
+uint_divrem_guard! {
+    impl<const LANES: usize> Div for Simd<usize, LANES> {
+        fn div
+    }
+}
+
+uint_divrem_guard! {
+    impl<const LANES: usize> Rem for Simd<usize, LANES> {
+        fn rem
+    }
+}
+
+// Bit Logic
+// Only applies to integer types
+
+unsafe_base_op! {
+    impl<const LANES: usize> BitAnd for Simd<i8, LANES> {
+        fn bitand(self, rhs: Self) -> Self::Output {
+            unsafe { simd_and }
+        }
+    }
+}
+
+unsafe_base_op! {
+    impl<const LANES: usize> BitAnd for Simd<i16, LANES> {
+        fn bitand(self, rhs: Self) -> Self::Output {
+            unsafe { simd_and }
+        }
+    }
+}
+
+unsafe_base_op! {
+    impl<const LANES: usize> BitAnd for Simd<i32, LANES> {
+        fn bitand(self, rhs: Self) -> Self::Output {
+            unsafe { simd_and }
+        }
+    }
+}
+
+unsafe_base_op! {
+    impl<const LANES: usize> BitAnd for Simd<i64, LANES> {
+        fn bitand(self, rhs: Self) -> Self::Output {
+            unsafe { simd_and }
+        }
+    }
+}
+
+unsafe_base_op! {
+    impl<const LANES: usize> BitAnd for Simd<isize, LANES> {
+        fn bitand(self, rhs: Self) -> Self::Output {
+            unsafe { simd_and }
+        }
+    }
+}
+
+unsafe_base_op! {
+    impl<const LANES: usize> BitAnd for Simd<u8, LANES> {
+        fn bitand(self, rhs: Self) -> Self::Output {
+            unsafe { simd_and }
+        }
+    }
+}
+
+unsafe_base_op! {
+    impl<const LANES: usize> BitAnd for Simd<u16, LANES> {
+        fn bitand(self, rhs: Self) -> Self::Output {
+            unsafe { simd_and }
+        }
+    }
+}
+
+unsafe_base_op! {
+    impl<const LANES: usize> BitAnd for Simd<u32, LANES> {
+        fn bitand(self, rhs: Self) -> Self::Output {
+            unsafe { simd_and }
+        }
+    }
+}
+
+unsafe_base_op! {
+    impl<const LANES: usize> BitAnd for Simd<u64, LANES> {
+        fn bitand(self, rhs: Self) -> Self::Output {
+            unsafe { simd_and }
+        }
+    }
+}
+
+unsafe_base_op! {
+    impl<const LANES: usize> BitAnd for Simd<usize, LANES> {
+        fn bitand(self, rhs: Self) -> Self::Output {
+            unsafe { simd_and }
+        }
+    }
+}
+
+unsafe_base_op! {
+    impl<const LANES: usize> BitOr for Simd<i8, LANES> {
+        fn bitor(self, rhs: Self) -> Self::Output {
+            unsafe { simd_or }
+        }
+    }
+}
+
+unsafe_base_op! {
+    impl<const LANES: usize> BitOr for Simd<i16, LANES> {
+        fn bitor(self, rhs: Self) -> Self::Output {
+            unsafe { simd_or }
+        }
+    }
+}
+
+unsafe_base_op! {
+    impl<const LANES: usize> BitOr for Simd<i32, LANES> {
+        fn bitor(self, rhs: Self) -> Self::Output {
+            unsafe { simd_or }
+        }
+    }
+}
+
+unsafe_base_op! {
+    impl<const LANES: usize> BitOr for Simd<i64, LANES> {
+        fn bitor(self, rhs: Self) -> Self::Output {
+            unsafe { simd_or }
+        }
+    }
+}
+
+unsafe_base_op! {
+    impl<const LANES: usize> BitOr for Simd<isize, LANES> {
+        fn bitor(self, rhs: Self) -> Self::Output {
+            unsafe { simd_or }
+        }
+    }
+}
+
+unsafe_base_op! {
+    impl<const LANES: usize> BitOr for Simd<u8, LANES> {
+        fn bitor(self, rhs: Self) -> Self::Output {
+            unsafe { simd_or }
+        }
+    }
+}
+
+unsafe_base_op! {
+    impl<const LANES: usize> BitOr for Simd<u16, LANES> {
+        fn bitor(self, rhs: Self) -> Self::Output {
+            unsafe { simd_or }
+        }
+    }
+}
+
+unsafe_base_op! {
+    impl<const LANES: usize> BitOr for Simd<u32, LANES> {
+        fn bitor(self, rhs: Self) -> Self::Output {
+            unsafe { simd_or }
+        }
+    }
+}
+
+unsafe_base_op! {
+    impl<const LANES: usize> BitOr for Simd<u64, LANES> {
+        fn bitor(self, rhs: Self) -> Self::Output {
+            unsafe { simd_or }
+        }
+    }
+}
+
+unsafe_base_op! {
+    impl<const LANES: usize> BitOr for Simd<usize, LANES> {
+        fn bitor(self, rhs: Self) -> Self::Output {
+            unsafe { simd_or }
+        }
+    }
+}
+
+unsafe_base_op! {
+    impl<const LANES: usize> BitXor for Simd<i8, LANES> {
+        fn bitxor(self, rhs: Self) -> Self::Output {
+            unsafe { simd_xor }
+        }
+    }
+}
+
+unsafe_base_op! {
+    impl<const LANES: usize> BitXor for Simd<i16, LANES> {
+        fn bitxor(self, rhs: Self) -> Self::Output {
+            unsafe { simd_xor }
+        }
+    }
+}
+
+unsafe_base_op! {
+    impl<const LANES: usize> BitXor for Simd<i32, LANES> {
+        fn bitxor(self, rhs: Self) -> Self::Output {
+            unsafe { simd_xor }
+        }
+    }
+}
+
+unsafe_base_op! {
+    impl<const LANES: usize> BitXor for Simd<i64, LANES> {
+        fn bitxor(self, rhs: Self) -> Self::Output {
+            unsafe { simd_xor }
+        }
+    }
+}
+
+unsafe_base_op! {
+    impl<const LANES: usize> BitXor for Simd<isize, LANES> {
+        fn bitxor(self, rhs: Self) -> Self::Output {
+            unsafe { simd_xor }
+        }
+    }
+}
+
+unsafe_base_op! {
+    impl<const LANES: usize> BitXor for Simd<u8, LANES> {
+        fn bitxor(self, rhs: Self) -> Self::Output {
+            unsafe { simd_xor }
+        }
+    }
+}
+
+unsafe_base_op! {
+    impl<const LANES: usize> BitXor for Simd<u16, LANES> {
+        fn bitxor(self, rhs: Self) -> Self::Output {
+            unsafe { simd_xor }
+        }
+    }
+}
+
+unsafe_base_op! {
+    impl<const LANES: usize> BitXor for Simd<u32, LANES> {
+        fn bitxor(self, rhs: Self) -> Self::Output {
+            unsafe { simd_xor }
+        }
+    }
+}
+
+unsafe_base_op! {
+    impl<const LANES: usize> BitXor for Simd<u64, LANES> {
+        fn bitxor(self, rhs: Self) -> Self::Output {
+            unsafe { simd_xor }
+        }
+    }
+}
+
+unsafe_base_op! {
+    impl<const LANES: usize> BitXor for Simd<usize, LANES> {
+        fn bitxor(self, rhs: Self) -> Self::Output {
+            unsafe { simd_xor }
+        }
+    }
+}
+
+macro_rules! bitshift_guard {
+    (impl<const LANES: usize> $op:ident for Simd<$int:ty, LANES> {
+        fn $call:ident(self, rhs: Self) -> Self::Output {
+            unsafe { $simd_call:ident }
+        }
+    }) => {
+        impl<const LANES: usize> $op for Simd<$int, LANES>
+        where
+            $int: SimdElement,
+            LaneCount<LANES>: SupportedLaneCount,
+        {
+            type Output = Self;
+
+            #[inline]
+            fn $call(self, rhs: Self) -> Self::Output {
+                unsafe {
+                    $crate::intrinsics::$simd_call(self, rhs.bitand(<$int>::BITS as $int - 1))
                 }
             }
-
-            impl_ref_ops! {
-                impl<const LANES: usize> core::ops::Div<$scalar> for Simd<$scalar, LANES>
-                where
-                    LaneCount<LANES>: SupportedLaneCount,
-                {
-                    type Output = Self;
-
-                    #[inline]
-                    fn div(self, rhs: $scalar) -> Self::Output {
-                        if rhs == 0 {
-                            panic!("attempt to divide by zero");
-                        }
-                        if <$scalar>::MIN != 0 &&
-                            self.as_array().iter().any(|x| *x == <$scalar>::MIN) &&
-                            rhs == -1 as _ {
-                                panic!("attempt to divide with overflow");
-                        }
-                        let rhs = Self::splat(rhs);
-                        unsafe { intrinsics::simd_div(self, rhs) }
-                    }
-                }
-            }
-
-            impl_ref_ops! {
-                impl<const LANES: usize> core::ops::Div<Simd<$scalar, LANES>> for $scalar
-                where
-                    LaneCount<LANES>: SupportedLaneCount,
-                {
-                    type Output = Simd<$scalar, LANES>;
-
-                    #[inline]
-                    fn div(self, rhs: Simd<$scalar, LANES>) -> Self::Output {
-                        Simd::splat(self) / rhs
-                    }
-                }
-            }
-
-            impl_ref_ops! {
-                impl<const LANES: usize> core::ops::DivAssign<Self> for Simd<$scalar, LANES>
-                where
-                    LaneCount<LANES>: SupportedLaneCount,
-                {
-                    #[inline]
-                    fn div_assign(&mut self, rhs: Self) {
-                        *self = *self / rhs;
-                    }
-                }
-            }
-
-            impl_ref_ops! {
-                impl<const LANES: usize> core::ops::DivAssign<$scalar> for Simd<$scalar, LANES>
-                where
-                    LaneCount<LANES>: SupportedLaneCount,
-                {
-                    #[inline]
-                    fn div_assign(&mut self, rhs: $scalar) {
-                        *self = *self / rhs;
-                    }
-                }
-            }
-
-            // remainder panics on zero divisor
-            impl_ref_ops! {
-                impl<const LANES: usize> core::ops::Rem<Self> for Simd<$scalar, LANES>
-                where
-                    LaneCount<LANES>: SupportedLaneCount,
-                {
-                    type Output = Self;
-
-                    #[inline]
-                    fn rem(self, rhs: Self) -> Self::Output {
-                        if rhs.as_array()
-                            .iter()
-                            .any(|x| *x == 0)
-                        {
-                            panic!("attempt to calculate the remainder with a divisor of zero");
-                        }
-
-                        // Guards for rem(MIN, -1)
-                        // this branch applies the check only to signed ints
-                        if <$scalar>::MIN != 0 && self.as_array().iter()
-                                .zip(rhs.as_array().iter())
-                                .any(|(x,y)| *x == <$scalar>::MIN && *y == -1 as _) {
-                            panic!("attempt to calculate the remainder with overflow");
-                        }
-                        unsafe { intrinsics::simd_rem(self, rhs) }
-                    }
-                }
-            }
-
-            impl_ref_ops! {
-                impl<const LANES: usize> core::ops::Rem<$scalar> for Simd<$scalar, LANES>
-                where
-                    LaneCount<LANES>: SupportedLaneCount,
-                {
-                    type Output = Self;
-
-                    #[inline]
-                    fn rem(self, rhs: $scalar) -> Self::Output {
-                        if rhs == 0 {
-                            panic!("attempt to calculate the remainder with a divisor of zero");
-                        }
-                        if <$scalar>::MIN != 0 &&
-                            self.as_array().iter().any(|x| *x == <$scalar>::MIN) &&
-                            rhs == -1 as _ {
-                                panic!("attempt to calculate the remainder with overflow");
-                        }
-                        let rhs = Self::splat(rhs);
-                        unsafe { intrinsics::simd_rem(self, rhs) }
-                    }
-                }
-            }
-
-            impl_ref_ops! {
-                impl<const LANES: usize> core::ops::Rem<Simd<$scalar, LANES>> for $scalar
-                where
-                    LaneCount<LANES>: SupportedLaneCount,
-                {
-                    type Output = Simd<$scalar, LANES>;
-
-                    #[inline]
-                    fn rem(self, rhs: Simd<$scalar, LANES>) -> Self::Output {
-                        Simd::splat(self) % rhs
-                    }
-                }
-            }
-
-            impl_ref_ops! {
-                impl<const LANES: usize> core::ops::RemAssign<Self> for Simd<$scalar, LANES>
-                where
-                    LaneCount<LANES>: SupportedLaneCount,
-                {
-                    #[inline]
-                    fn rem_assign(&mut self, rhs: Self) {
-                        *self = *self % rhs;
-                    }
-                }
-            }
-
-            impl_ref_ops! {
-                impl<const LANES: usize> core::ops::RemAssign<$scalar> for Simd<$scalar, LANES>
-                where
-                    LaneCount<LANES>: SupportedLaneCount,
-                {
-                    #[inline]
-                    fn rem_assign(&mut self, rhs: $scalar) {
-                        *self = *self % rhs;
-                    }
-                }
-            }
-
-            // shifts panic on overflow
-            impl_ref_ops! {
-                impl<const LANES: usize> core::ops::Shl<Self> for Simd<$scalar, LANES>
-                where
-                    LaneCount<LANES>: SupportedLaneCount,
-                {
-                    type Output = Self;
-
-                    #[inline]
-                    fn shl(self, rhs: Self) -> Self::Output {
-                        // TODO there is probably a better way of doing this
-                        if rhs.as_array()
-                            .iter()
-                            .copied()
-                            .any(invalid_shift_rhs)
-                        {
-                            panic!("attempt to shift left with overflow");
-                        }
-                        unsafe { intrinsics::simd_shl(self, rhs) }
-                    }
-                }
-            }
-
-            impl_ref_ops! {
-                impl<const LANES: usize> core::ops::Shl<$scalar> for Simd<$scalar, LANES>
-                where
-                    LaneCount<LANES>: SupportedLaneCount,
-                {
-                    type Output = Self;
-
-                    #[inline]
-                    fn shl(self, rhs: $scalar) -> Self::Output {
-                        if invalid_shift_rhs(rhs) {
-                            panic!("attempt to shift left with overflow");
-                        }
-                        let rhs = Self::splat(rhs);
-                        unsafe { intrinsics::simd_shl(self, rhs) }
-                    }
-                }
-            }
-
-
-            impl_ref_ops! {
-                impl<const LANES: usize> core::ops::ShlAssign<Self> for Simd<$scalar, LANES>
-                where
-                    LaneCount<LANES>: SupportedLaneCount,
-                {
-                    #[inline]
-                    fn shl_assign(&mut self, rhs: Self) {
-                        *self = *self << rhs;
-                    }
-                }
-            }
-
-            impl_ref_ops! {
-                impl<const LANES: usize> core::ops::ShlAssign<$scalar> for Simd<$scalar, LANES>
-                where
-                    LaneCount<LANES>: SupportedLaneCount,
-                {
-                    #[inline]
-                    fn shl_assign(&mut self, rhs: $scalar) {
-                        *self = *self << rhs;
-                    }
-                }
-            }
-
-            impl_ref_ops! {
-                impl<const LANES: usize> core::ops::Shr<Self> for Simd<$scalar, LANES>
-                where
-                    LaneCount<LANES>: SupportedLaneCount,
-                {
-                    type Output = Self;
-
-                    #[inline]
-                    fn shr(self, rhs: Self) -> Self::Output {
-                        // TODO there is probably a better way of doing this
-                        if rhs.as_array()
-                            .iter()
-                            .copied()
-                            .any(invalid_shift_rhs)
-                        {
-                            panic!("attempt to shift with overflow");
-                        }
-                        unsafe { intrinsics::simd_shr(self, rhs) }
-                    }
-                }
-            }
-
-            impl_ref_ops! {
-                impl<const LANES: usize> core::ops::Shr<$scalar> for Simd<$scalar, LANES>
-                where
-                    LaneCount<LANES>: SupportedLaneCount,
-                {
-                    type Output = Self;
-
-                    #[inline]
-                    fn shr(self, rhs: $scalar) -> Self::Output {
-                        if invalid_shift_rhs(rhs) {
-                            panic!("attempt to shift with overflow");
-                        }
-                        let rhs = Self::splat(rhs);
-                        unsafe { intrinsics::simd_shr(self, rhs) }
-                    }
-                }
-            }
-
-
-            impl_ref_ops! {
-                impl<const LANES: usize> core::ops::ShrAssign<Self> for Simd<$scalar, LANES>
-                where
-                    LaneCount<LANES>: SupportedLaneCount,
-                {
-                    #[inline]
-                    fn shr_assign(&mut self, rhs: Self) {
-                        *self = *self >> rhs;
-                    }
-                }
-            }
-
-            impl_ref_ops! {
-                impl<const LANES: usize> core::ops::ShrAssign<$scalar> for Simd<$scalar, LANES>
-                where
-                    LaneCount<LANES>: SupportedLaneCount,
-                {
-                    #[inline]
-                    fn shr_assign(&mut self, rhs: $scalar) {
-                        *self = *self >> rhs;
-                    }
-                }
-            }
-        )*
+        }
     };
 }
 
-/// Implements unsigned integer operators for the provided types.
-macro_rules! impl_signed_int_ops {
-    { $($scalar:ty),* } => {
-        impl_unsigned_int_ops! { $($scalar),* }
-        $( // scalar
-            impl_op! { impl Neg for $scalar }
-        )*
-    };
+bitshift_guard! {
+    impl<const LANES: usize> Shl for Simd<i8, LANES> {
+        fn shl(self, rhs: Self) -> Self::Output {
+            unsafe { simd_shl }
+        }
+    }
 }
 
-impl_unsigned_int_ops! { u8, u16, u32, u64, usize }
-impl_signed_int_ops! { i8, i16, i32, i64, isize }
-impl_float_ops! { f32, f64 }
+bitshift_guard! {
+    impl<const LANES: usize> Shl for Simd<i16, LANES> {
+        fn shl(self, rhs: Self) -> Self::Output {
+            unsafe { simd_shl }
+        }
+    }
+}
+
+bitshift_guard! {
+    impl<const LANES: usize> Shl for Simd<i32, LANES> {
+        fn shl(self, rhs: Self) -> Self::Output {
+            unsafe { simd_shl }
+        }
+    }
+}
+
+bitshift_guard! {
+    impl<const LANES: usize> Shl for Simd<i64, LANES> {
+        fn shl(self, rhs: Self) -> Self::Output {
+            unsafe { simd_shl }
+        }
+    }
+}
+
+bitshift_guard! {
+    impl<const LANES: usize> Shl for Simd<isize, LANES> {
+        fn shl(self, rhs: Self) -> Self::Output {
+            unsafe { simd_shl }
+        }
+    }
+}
+
+bitshift_guard! {
+    impl<const LANES: usize> Shl for Simd<u8, LANES> {
+        fn shl(self, rhs: Self) -> Self::Output {
+            unsafe { simd_shl }
+        }
+    }
+}
+
+bitshift_guard! {
+    impl<const LANES: usize> Shl for Simd<u16, LANES> {
+        fn shl(self, rhs: Self) -> Self::Output {
+            unsafe { simd_shl }
+        }
+    }
+}
+
+bitshift_guard! {
+    impl<const LANES: usize> Shl for Simd<u32, LANES> {
+        fn shl(self, rhs: Self) -> Self::Output {
+            unsafe { simd_shl }
+        }
+    }
+}
+
+bitshift_guard! {
+    impl<const LANES: usize> Shl for Simd<u64, LANES> {
+        fn shl(self, rhs: Self) -> Self::Output {
+            unsafe { simd_shl }
+        }
+    }
+}
+
+bitshift_guard! {
+    impl<const LANES: usize> Shl for Simd<usize, LANES> {
+        fn shl(self, rhs: Self) -> Self::Output {
+            unsafe { simd_shl }
+        }
+    }
+}
+
+bitshift_guard! {
+    impl<const LANES: usize> Shr for Simd<i8, LANES> {
+        fn shr(self, rhs: Self) -> Self::Output {
+            unsafe { simd_shr }
+        }
+    }
+}
+
+bitshift_guard! {
+    impl<const LANES: usize> Shr for Simd<i16, LANES> {
+        fn shr(self, rhs: Self) -> Self::Output {
+            unsafe { simd_shr }
+        }
+    }
+}
+
+bitshift_guard! {
+    impl<const LANES: usize> Shr for Simd<i32, LANES> {
+        fn shr(self, rhs: Self) -> Self::Output {
+            unsafe { simd_shr }
+        }
+    }
+}
+
+bitshift_guard! {
+    impl<const LANES: usize> Shr for Simd<i64, LANES> {
+        fn shr(self, rhs: Self) -> Self::Output {
+            unsafe { simd_shr }
+        }
+    }
+}
+
+bitshift_guard! {
+    impl<const LANES: usize> Shr for Simd<isize, LANES> {
+        fn shr(self, rhs: Self) -> Self::Output {
+            unsafe { simd_shr }
+        }
+    }
+}
+
+bitshift_guard! {
+    impl<const LANES: usize> Shr for Simd<u8, LANES> {
+        fn shr(self, rhs: Self) -> Self::Output {
+            unsafe { simd_shr }
+        }
+    }
+}
+
+bitshift_guard! {
+    impl<const LANES: usize> Shr for Simd<u16, LANES> {
+        fn shr(self, rhs: Self) -> Self::Output {
+            unsafe { simd_shr }
+        }
+    }
+}
+
+bitshift_guard! {
+    impl<const LANES: usize> Shr for Simd<u32, LANES> {
+        fn shr(self, rhs: Self) -> Self::Output {
+            unsafe { simd_shr }
+        }
+    }
+}
+
+bitshift_guard! {
+    impl<const LANES: usize> Shr for Simd<u64, LANES> {
+        fn shr(self, rhs: Self) -> Self::Output {
+            unsafe { simd_shr }
+        }
+    }
+}
+
+bitshift_guard! {
+    impl<const LANES: usize> Shr for Simd<usize, LANES> {
+        fn shr(self, rhs: Self) -> Self::Output {
+            unsafe { simd_shr }
+        }
+    }
+}
+
+// Reference ops
+// Implicit deref on method calls should handle the LHS, so manually deref RHS
+
+impl<T, const LANES: usize> Add<&Self> for Simd<T, LANES>
+where
+    Self: Add<Self, Output = Self>,
+    T: SimdElement,
+    LaneCount<LANES>: SupportedLaneCount,
+{
+    type Output = Self;
+
+    #[inline]
+    fn add(self, rhs: &Self) -> Self::Output {
+        self.add(*rhs)
+    }
+}
+
+impl<T, const LANES: usize> Mul<&Self> for Simd<T, LANES>
+where
+    Self: Mul<Self, Output = Self>,
+    T: SimdElement,
+    LaneCount<LANES>: SupportedLaneCount,
+{
+    type Output = Self;
+
+    #[inline]
+    fn mul(self, rhs: &Self) -> Self::Output {
+        self.mul(*rhs)
+    }
+}
+
+impl<T, const LANES: usize> Div<&Self> for Simd<T, LANES>
+where
+    Self: Div<Output = Self>,
+    T: SimdElement,
+    LaneCount<LANES>: SupportedLaneCount,
+{
+    type Output = Self;
+
+    #[inline]
+    fn div(self, rhs: &Self) -> Self::Output {
+        self.div(*rhs)
+    }
+}
+
+impl<T, const LANES: usize> Rem<&Self> for Simd<T, LANES>
+where
+    Self: Rem<Output = Self>,
+    T: SimdElement,
+    LaneCount<LANES>: SupportedLaneCount,
+{
+    type Output = Self;
+
+    #[inline]
+    fn rem(self, rhs: &Self) -> Self::Output {
+        self.rem(*rhs)
+    }
+}
+
+impl<T, const LANES: usize> BitAnd<&Self> for Simd<T, LANES>
+where
+    Self: BitAnd<Output = Self>,
+    T: SimdElement,
+    LaneCount<LANES>: SupportedLaneCount,
+{
+    type Output = Self;
+
+    #[inline]
+    fn bitand(self, rhs: &Self) -> Self::Output {
+        self.bitand(*rhs)
+    }
+}
+
+impl<T, const LANES: usize> BitOr<&Self> for Simd<T, LANES>
+where
+    Self: BitOr<Output = Self>,
+    T: SimdElement,
+    LaneCount<LANES>: SupportedLaneCount,
+{
+    type Output = Self;
+
+    #[inline]
+    fn bitor(self, rhs: &Self) -> Self::Output {
+        self.bitor(*rhs)
+    }
+}
+
+impl<T, const LANES: usize> BitXor<&Self> for Simd<T, LANES>
+where
+    Self: BitXor<Output = Self>,
+    T: SimdElement,
+    LaneCount<LANES>: SupportedLaneCount,
+{
+    type Output = Self;
+
+    #[inline]
+    fn bitxor(self, rhs: &Self) -> Self::Output {
+        self.bitxor(*rhs)
+    }
+}
+
+impl<T, const LANES: usize> Shl<&Self> for Simd<T, LANES>
+where
+    Self: Shl<Output = Self>,
+    T: SimdElement,
+    LaneCount<LANES>: SupportedLaneCount,
+{
+    type Output = Self;
+
+    #[inline]
+    fn shl(self, rhs: &Self) -> Self::Output {
+        self.shl(*rhs)
+    }
+}
+
+impl<T, const LANES: usize> Shr<&Self> for Simd<T, LANES>
+where
+    Self: Shr<Output = Self>,
+    T: SimdElement,
+    LaneCount<LANES>: SupportedLaneCount,
+{
+    type Output = Self;
+
+    #[inline]
+    fn shr(self, rhs: &Self) -> Self::Output {
+        self.shr(*rhs)
+    }
+}
